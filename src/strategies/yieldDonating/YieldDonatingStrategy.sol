@@ -4,9 +4,43 @@ pragma solidity ^0.8.25;
 import {BaseStrategy} from "@octant-core/core/BaseStrategy.sol";
 import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import {IERC4626} from "@openzeppelin/contracts/interfaces/IERC4626.sol";
 
-// todo implement IYieldSource interface
-interface IYieldSource {}
+/**
+ * @title IAaveVault
+ * @notice Interface for Aave's ERC-4626 ATokenVault
+ * @dev Extends IERC4626 with Aave-specific deposit/withdraw variants
+ */
+interface IYieldSource is IERC4626 {
+    /**
+     * @notice Deposit pre-existing aTokens directly
+     * @param assets Amount of aTokens to deposit
+     * @param receiver Address to receive vault shares
+     * @return shares Amount of shares minted
+     */
+    function depositATokens(uint256 assets, address receiver) external returns (uint256 shares);
+
+    /**
+     * @notice Withdraw as aTokens instead of underlying asset
+     * @param assets Amount of underlying assets to withdraw
+     * @param receiver Address to receive aTokens
+     * @param owner Owner of the shares being burned
+     * @return shares Amount of shares burned
+     */
+    function withdrawATokens(uint256 assets, address receiver, address owner) external returns (uint256 shares);
+
+    /**
+     * @notice Get the underlying aToken address
+     * @return Address of the Aave aToken (e.g., aUSDC)
+     */
+    function aToken() external view returns (address);
+
+    /**
+     * @notice Get claimable vault manager fees
+     * @return Amount of fees accumulated
+     */
+    function getClaimableFees() external view returns (uint256);
+}
 
 /**
  * @title YieldDonating Strategy Template
@@ -23,7 +57,7 @@ contract YieldDonatingStrategy is BaseStrategy {
     using SafeERC20 for ERC20;
 
     /// @notice Address of the yield source (e.g., Aave pool, Compound, Yearn vault)
-    IYieldSource public immutable yieldSource;
+    IYieldSource public immutable YIELD_SOURCE;
 
     /**
      * @param _asset Address of the underlying asset
@@ -57,10 +91,15 @@ contract YieldDonatingStrategy is BaseStrategy {
             _tokenizedStrategyAddress
         )
     {
-        yieldSource = IYieldSource(_yieldSource);
+        YIELD_SOURCE = IYieldSource(_yieldSource);
 
-        // max allow Yield source to withdraw assets
+        // Approve yield source to pull assets during deposits
         ERC20(_asset).forceApprove(_yieldSource, type(uint256).max);
+        
+        // Approve yield source to burn our vault shares during withdrawals
+        // This is needed because ERC4626 vaults check allowance even when owner == msg.sender
+        // in some implementations (like ATokenVault)
+        ERC20(_yieldSource).forceApprove(_yieldSource, type(uint256).max);
 
         // TokenizedStrategy initialization will be handled separately
         // This is just a template - the actual initialization depends on
@@ -83,11 +122,11 @@ contract YieldDonatingStrategy is BaseStrategy {
      * to deploy.
      */
     function _deployFunds(uint256 _amount) internal override {
-        // TODO: implement your logic to deploy funds into yield source
-        // Example for AAVE:
-        // yieldSource.supply(address(asset), _amount, address(this), 0);
-        // Example for ERC4626 vault:
-        // IERC4626(compounderVault).deposit(_amount, address(this));
+        if (_amount == 0) return;
+
+        // Deposit underlying to ATokenVault → receive vault shares
+        // ATokenVault handles Aave v3 supply() call internally
+        IYieldSource(address(YIELD_SOURCE)).deposit(_amount, address(this));
     }
 
     /**
@@ -112,41 +151,70 @@ contract YieldDonatingStrategy is BaseStrategy {
      * @param _amount, The amount of 'asset' to be freed.
      */
     function _freeFunds(uint256 _amount) internal override {
-        // TODO: implement your logic to free funds from yield source
-        // Example for AAVE:
-        // yieldSource.withdraw(address(asset), _amount, address(this));
-        // Example for ERC4626 vault:
-        // uint256 shares = IERC4626(compounderVault).convertToShares(_amount);
-        // IERC4626(compounderVault).redeem(shares, address(this), address(this));
+        if (_amount == 0) return;
+
+        // Withdraw underlying from ATokenVault
+        // Burns our vault shares, returns underlying to strategy
+        IYieldSource(address(YIELD_SOURCE)).withdraw(
+            _amount,
+            address(this), // receiver of underlying
+            address(this) // owner of shares being burned
+        );
     }
 
     /**
-     * @dev Internal function to harvest all rewards, redeploy any idle
-     * funds and return an accurate accounting of all funds currently
-     * held by the Strategy.
+     * @notice Report total assets held by strategy
+     * @return _totalAssets Total underlying value (idle + deployed with yield)
+     * @dev Trusted function called by keeper/management
+     *      Must return accurate asset accounting for profit/loss calculation
      *
-     * This should do any needed harvesting, rewards selling, accrual,
-     * redepositing etc. to get the most accurate view of current assets.
+     * ACCOUNTING COMPONENTS:
+     * 1. Idle: asset.balanceOf(address(this))
+     * 2. Vault Shares: yieldSource.balanceOf(address(this))
+     * 3. Deployed Value: yieldSource.convertToAssets(shares)
+     * 4. Total: idle + deployed
      *
-     * NOTE: All applicable assets including loose assets should be
-     * accounted for in this function.
+     * PROFIT/LOSS HANDLING (automatic by BaseStrategy):
+     * - If _totalAssets > lastReportedAssets → PROFIT detected
+     *   → BaseStrategy mints shares to donationAddress (dragonRouter)
+     *   → User PPS remains unchanged (dilution offset by assets)
      *
-     * Care should be taken when relying on oracles or swap values rather
-     * than actual amounts as all Strategy profit/loss accounting will
-     * be done based on this returned value.
+     * - If _totalAssets < lastReportedAssets → LOSS detected
+     *   → If enableBurning=true: Burns shares from donationAddress
+     *   → User PPS unchanged until donation buffer exhausted
+     *   → If enableBurning=false: Loss impacts all holders proportionally
      *
-     * This can still be called post a shutdown, a strategist can check
-     * `TokenizedStrategy.isShutdown()` to decide if funds should be
-     * redeployed or simply realize any profits/losses.
+     * YIELD SOURCE:
+     * - No reward tokens to claim (unlike Curve, Convex, etc.)
+     * - Aave lending APY accrues in ATokenVault exchange rate
+     * - convertToAssets() increases over time as yield accrues
+     * - No harvesting or swapping required
      *
-     * @return _totalAssets A trusted and accurate account for the total
-     * amount of 'asset' the strategy currently holds including idle funds.
+     * POST-SHUTDOWN BEHAVIOR:
+     * - Can still be called after shutdown
+     * - Check TokenizedStrategy.isShutdown() if redeployment logic exists
+     * - For this strategy: no redeployment, purely accounting
      */
     function _harvestAndReport() internal override returns (uint256 _totalAssets) {
         // TODO: Implement harvesting logic
         // 1. Amount of assets claimable from the yield source
         // 2. Amount of assets idle in the strategy
         // 3. Return the total (assets claimable + assets idle)
+
+        // Idle assets sitting in strategy contract
+        uint256 idle = asset.balanceOf(address(this));
+
+        // Vault shares held by this strategy
+        uint256 vaultShares = IYieldSource(address(YIELD_SOURCE)).balanceOf(address(this));
+
+        // Convert vault shares to underlying value (includes accrued yield)
+        uint256 deployed = IYieldSource(address(YIELD_SOURCE)).convertToAssets(vaultShares);
+
+        // Return total assets under management
+        _totalAssets = idle + deployed;
+
+        // BaseStrategy compares _totalAssets with previous report
+        // Automatically handles profit minting / loss burning
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -154,22 +222,41 @@ contract YieldDonatingStrategy is BaseStrategy {
     //////////////////////////////////////////////////////////////*/
 
     /**
-     * @notice Gets the max amount of `asset` that can be withdrawn.
-     * @dev Can be overridden to implement withdrawal limits.
-     * @return . The available amount that can be withdrawn.
+     * @notice Get maximum withdrawal limit based on Aave liquidity
+     * @return Maximum assets that can be withdrawn
+     * @dev Mirrors ATokenVault's maxWithdraw which checks:
+     *      - Aave v3 available liquidity (totalLiquidity - borrowed)
+     *      - Reserve active/paused status
+     *      - Strategy's deployed position
+     *
+     * USAGE:
+     * - Called by TokenizedStrategy before withdraw
+     * - Prevents revert on illiquid withdrawals
+     * - Returns 0 if Aave pool is fully utilized
+     *
+     * IMPLEMENTATION NOTE:
+     * - Does not include idle assets (handled separately)
+     * - Represents only what can be freed from yield source
      */
-    function availableWithdrawLimit(address /*_owner*/) public view virtual override returns (uint256) {
-        return type(uint256).max;
+    function availableWithdrawLimit(address /*_owner*/) public view override returns (uint256) {
+        return IYieldSource(address(YIELD_SOURCE)).maxWithdraw(address(this));
     }
 
     /**
-     * @notice Gets the max amount of `asset` that can be deposited.
-     * @dev Can be overridden to implement deposit limits.
-     * @param . The address that will deposit.
-     * @return . The available amount that can be deposited.
+     * @notice Get maximum deposit limit based on Aave constraints
+     * @return Maximum assets that can be deposited
+     * @dev Mirrors ATokenVault's maxDeposit which checks:
+     *      - Aave v3 supply cap per asset
+     *      - Reserve active/paused status
+     *      - Vault-specific limits (if any)
+     *
+     * USAGE:
+     * - Called by TokenizedStrategy before deposit
+     * - Prevents revert by pre-checking limits
+     * - Updates as Aave state changes
      */
     function availableDepositLimit(address /*_owner*/) public view virtual override returns (uint256) {
-        return type(uint256).max;
+        return IYieldSource(address(YIELD_SOURCE)).maxDeposit(address(this));
     }
 
     /**
@@ -219,6 +306,15 @@ contract YieldDonatingStrategy is BaseStrategy {
      * to check if the strategy is shutdown during {_harvestAndReport}
      * so that it does not simply re-deploy all funds that had been freed.
      *
+     * USAGE SCENARIO:
+     * 1. emergencyAdmin calls shutdownStrategy()
+     * 2. emergencyAdmin calls emergencyWithdraw() to free funds
+     * 3. Management calls report() to realize any profit/loss
+     *
+     * IMPLEMENTATION NOTE:
+     * - _amount may exceed deployed balance (withdraw what's possible)
+     * - Check isShutdown() in _harvestAndReport to prevent redeployment
+     *
      * EX:
      *   if(freeAsset > 0 && !TokenizedStrategy.isShutdown()) {
      *       depositFunds...
@@ -226,5 +322,11 @@ contract YieldDonatingStrategy is BaseStrategy {
      *
      * @param _amount The amount of asset to attempt to free.
      */
-    function _emergencyWithdraw(uint256 _amount) internal virtual override {}
+    function _emergencyWithdraw(uint256 _amount) internal override {
+        if (_amount == 0) return;
+
+        // Force withdrawal from ATokenVault
+        // May revert if Aave liquidity insufficient
+        IYieldSource(address(YIELD_SOURCE)).withdraw(_amount, address(this), address(this));
+    }
 }
