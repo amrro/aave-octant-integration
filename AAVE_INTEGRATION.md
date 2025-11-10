@@ -740,12 +740,12 @@ cast send $STRATEGY_ADDRESS "deposit(uint256,address)(uint256)" 1000000 $USER_AD
 ### Implementation
 
 - **Core Strategy:** `src/strategies/yieldDonating/YieldDonatingStrategy.sol`
-  - Lines 127-132: `_deployFunds()` - Deposits to Aave via ERC-4626
-  - Lines 159-167: `_freeFunds()` - Withdraws from Aave via ERC-4626
-  - Lines 186-214: `_harvestAndReport()` - Yield accounting
-  - Lines 235-238: `availableWithdrawLimit()` - Liquidity check
-  - Lines 248-250: `availableDepositLimit()` - Supply cap check
-  - Lines 299-305: `_emergencyWithdraw()` - Emergency shutdown
+  - `_deployFunds()` - Deposits to Aave via ERC-4626
+  - `_freeFunds()` - Withdraws from Aave via ERC-4626
+  - `_harvestAndReport()` - Yield accounting
+  - `availableWithdrawLimit()` - Liquidity check
+  - `availableDepositLimit()` - Supply cap check
+  - `_emergencyWithdraw()` - Emergency shutdown
 
 - **Interface:** `src/strategies/yieldDonating/YieldDonatingStrategy.sol:30-58`
   - Defines `IYieldSource` extending IERC4626 with Aave functions
@@ -753,17 +753,17 @@ cast send $STRATEGY_ADDRESS "deposit(uint256,address)(uint256)" 1000000 $USER_AD
 ### Scripts
 
 - **Deployment:** `script/DeployAaveStrategy.s.sol`
-  - Lines 105-120: Configuration (USDC vault setup)
-  - Lines 137-177: Pre-deployment validation
-  - Lines 179-201: Deployment logic
-  - Lines 203-226: Post-deployment verification
+  - Configuration (USDC vault setup)
+  - Pre-deployment validation
+  - Deployment logic
+  - Post-deployment verification
 
 - **Interaction Demo:** `script/InteractWithStrategy.s.sol`
   - Complete user journey demonstration
-  - Lines 91-113: User deposits
-  - Lines 135-151: Keeper report
-  - Lines 153-183: User withdrawals
-  - Lines 185-199: Final state verification
+  -  User deposits
+  - Keeper report
+  - User withdrawals
+  - Final state verification
 
 ### Tests
 
